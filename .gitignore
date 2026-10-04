@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 data/
 logs/
+
+# one-off manual API scripts must never be committed
+manual_*.py
