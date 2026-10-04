@@ -23,6 +23,10 @@ class RoostooError(RuntimeError):
     pass
 
 
+class RoostooFatalError(RoostooError):
+    """4xx response: retrying will not help (wrong key, wrong host, bad request)."""
+
+
 class RoostooClient:
     def __init__(self, api_key: str, secret_key: str, base_url: str = "https://mock-api.roostoo.com",
                  min_interval: float = 0.35, timeout: float = 10.0, max_retries: int = 3):
@@ -85,13 +89,20 @@ class RoostooClient:
                     resp = self.session.post(url, data=body, headers=headers, timeout=self.timeout)
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise RoostooError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    # client errors (bad key, wrong host, bad params) won't fix themselves: fail fast
+                    # and keep the server's own message for the logs
+                    logger.event("api", method=method, path=path, params=params, success=False,
+                                 err=f"HTTP {resp.status_code}: {resp.text[:300]}")
+                    raise RoostooFatalError(f"{method} {path} -> HTTP {resp.status_code}: {resp.text[:300]}")
                 data = resp.json()
                 ok = data.get("Success", True) if isinstance(data, dict) else True
                 logger.event("api", method=method, path=path,
                              params={k: v for k, v in p.items() if k != "timestamp"},
                              success=ok, err=(data.get("ErrMsg") if isinstance(data, dict) else None))
                 return data
+            except RoostooFatalError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 logger.event("api", method=method, path=path, params=params, success=False,
