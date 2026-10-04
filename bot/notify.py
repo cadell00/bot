@@ -14,7 +14,7 @@ import time
 
 import requests
 
-from .. import logger
+from . import logger
 
 log = logger.get("notify")
 
