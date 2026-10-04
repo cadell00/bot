@@ -119,3 +119,12 @@ On October 2025 to April 2026, which wasn't used in any design decision, the lon
 - **Remaining choices** (regime EMA 200 h, half-size longs in neutral, entry threshold 0.40) are the best value of each setting by median. All eight long-horizon, shorts-on settings scored within 3.3–4.2, so the result doesn't hinge on fine-tuning.
 
 The chosen setting returned +92.8% over the year (+25% in the bear half, +54% in the bull half), with a 14.3% max drawdown, composite 4.41, and 56% of 14-day windows positive, the highest of any setting. Backtests assume fills at hourly closes and pay 0.1% on every trade. Live results will differ.
+
+## Tested and rejected: "many small wins" (take-profit / intraday)
+
+`python backtest.py --days 365 --smallwins` tested take-profits (0.75×, 1.5× and 3× daily vol), intraday horizons (6/24/72 h) and 2-hour rebalancing against the deployed setup. The deployed setup (no take-profit, 1–4 week horizons, 8-hour rebalancing) ranked **first on the worse half**: composite 3.28, +87.8% over the year, 14.3% max drawdown, median 14-day return +0.71%.
+
+- **Take-profit at 0.75× daily vol** did raise the win rate (42% to 54%). But the average win fell from +5.9% to +3.4% against a −3.6% average loss, and the yearly return halved to +44.7%.
+- **Intraday horizons with 2-hour rebalancing** lost 19–34% over the year, on 4–5× the turnover.
+
+The bot's edge is trend persistence over weeks, so cutting winners early or trading faster mostly converts edge into fees. Take-profit stays in the code but is off by default (`TAKE_PROFIT_VOL_MULT=0`).
