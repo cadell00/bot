@@ -62,7 +62,7 @@ class StrategyParams:
     # --- sizing ---
     max_weight: float = _env("MAX_WEIGHT", 0.30)
     max_weight_major: float = _env("MAX_WEIGHT_MAJOR", 0.45)
-    target_daily_vol: float = _env("TARGET_DAILY_VOL", 0.02)   # 2%/day portfolio vol target
+    target_daily_vol: float = _env("TARGET_DAILY_VOL", 0.03)   # 3%/day portfolio vol target
     gross_cap: float = _env("GROSS_CAP", 0.95)                 # never > 95% invested (no leverage)
     full_conviction_score: float = _env("FULL_CONVICTION", 0.6)
     min_conviction: float = _env("MIN_CONVICTION", 0.35)
@@ -71,7 +71,7 @@ class StrategyParams:
     regime_price_buffer: float = _env("REGIME_PRICE_BUFFER", 0.01)  # 1% hysteresis around BTC EMA
     regime_score_buffer: float = _env("REGIME_SCORE_BUFFER", 0.10)  # hysteresis around score 0
     # --- risk ---
-    max_drawdown: float = _env("MAX_DRAWDOWN", 0.10)   # exposure -> floor as rolling DD approaches this
+    max_drawdown: float = _env("MAX_DRAWDOWN", 0.08)   # exposure -> floor as rolling DD approaches this
     dd_floor_mult: float = _env("DD_FLOOR_MULT", 0.25)  # never fully locked out of a recovery
     dd_lookback_hours: int = _env("DD_LOOKBACK_HOURS", 336)  # 14 days = competition length
     stop_vol_mult: float = _env("STOP_VOL_MULT", 2.5)  # trailing stop = k * daily vol
@@ -82,7 +82,7 @@ class StrategyParams:
     crash_cooldown_hours: int = _env("CRASH_COOLDOWN_HOURS", 6)
     # --- costs / trading ---
     rebalance_band: float = _env("REBALANCE_BAND", 0.05)  # ignore weight changes < 5% of equity
-    rebalance_every_hours: int = _env("REBALANCE_EVERY_HOURS", 4)
+    rebalance_every_hours: int = _env("REBALANCE_EVERY_HOURS", 8)  # UTC 00/08/16; stops run every minute
     taker_fee: float = 0.001
     maker_fee: float = 0.0005
 

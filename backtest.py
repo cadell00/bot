@@ -198,8 +198,11 @@ def main():
     ap.add_argument("--csv", default=None)
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--plot", action="store_true")
+    ap.add_argument("--since", default=None, help="only use data from this date, e.g. 2025-10-01")
+    ap.add_argument("--until", default=None, help="only use data up to this date (out-of-sample tests)")
     a = ap.parse_args()
     closes = pd.read_csv(a.csv, index_col=0, parse_dates=True) if a.csv else download(DEFAULT_UNIVERSE, a.days)
+    closes = closes.loc[a.since:a.until]
     closes = closes.dropna(axis=1, thresh=int(len(closes) * 0.7))
     print(f"data: {closes.shape[1]} assets, {len(closes)} hourly bars ({closes.index[0]} -> {closes.index[-1]})")
 
