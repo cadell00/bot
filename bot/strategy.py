@@ -190,6 +190,13 @@ def trailing_stop_pct(daily_vol: float, p: StrategyParams) -> float:
     return float(np.clip(p.stop_vol_mult * daily_vol, p.stop_min_pct, p.stop_max_pct))
 
 
+def take_profit_pct(daily_vol: float, p: StrategyParams) -> float:
+    """Favourable move (fraction) at which a position is closed; inf when disabled."""
+    if p.take_profit_vol_mult <= 0:
+        return float("inf")
+    return float(np.clip(p.take_profit_vol_mult * daily_vol, p.take_profit_min_pct, p.take_profit_max_pct))
+
+
 def btc_regime_inputs(closes: pd.DataFrame, score: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
     """Per-bar BTC price, trend EMA and smoothed score (vectorised; used live and in backtests)."""
     if "BTC" not in closes:

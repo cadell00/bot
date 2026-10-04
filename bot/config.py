@@ -86,6 +86,11 @@ class StrategyParams:
     stop_min_pct: float = _env("STOP_MIN_PCT", 0.06)
     stop_max_pct: float = _env("STOP_MAX_PCT", 0.15)
     stop_cooldown_hours: int = _env("STOP_COOLDOWN_HOURS", 12)
+    # take-profit: close a position once it has moved k x daily vol in our favour (0 = off)
+    take_profit_vol_mult: float = _env("TAKE_PROFIT_VOL_MULT", 0.0)
+    take_profit_min_pct: float = _env("TAKE_PROFIT_MIN_PCT", 0.01)
+    take_profit_max_pct: float = _env("TAKE_PROFIT_MAX_PCT", 0.10)
+    take_profit_cooldown_hours: int = _env("TAKE_PROFIT_COOLDOWN_HOURS", 8)
     crash_btc_1h: float = _env("CRASH_BTC_1H", -0.04)  # BTC -4% in 1h -> flatten
     crash_cooldown_hours: int = _env("CRASH_COOLDOWN_HOURS", 6)
     # --- costs / trading ---

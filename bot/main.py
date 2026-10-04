@@ -55,6 +55,7 @@ class State:
     lwm: dict = field(default_factory=dict)            # trailing-stop low-water marks (shorts)
     squeeze_until: float = 0.0                         # no new shorts until then
     shorts_disabled: bool = False                      # exchange said shorts are not allowed
+    entry_px: dict = field(default_factory=dict)       # coin -> price when position was opened (take-profit)
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -190,6 +191,7 @@ class Bot:
         st.hwm = {c: v for c, v in st.hwm.items() if c in held}
         st.lwm = {c: v for c, v in st.lwm.items() if c in held_short}
         st.entry_ts = {c: st.entry_ts.get(c, now) for c in held | held_short}
+        st.entry_px = {c: st.entry_px.get(c, book[c]["last"]) for c in held | held_short if c in book}
         for coin in held | held_short:
             if coin in urgent or coin not in book:
                 continue
@@ -201,6 +203,15 @@ class Bot:
             else:
                 st.lwm[coin] = min(st.lwm.get(coin, px), px)
                 hit, mark, side = px >= st.lwm[coin] * (1 + stop), st.lwm[coin], "short"
+            gain = (px / st.entry_px[coin] - 1) * (1 if side == "long" else -1) if coin in st.entry_px else 0.0
+            tp = strategy.take_profit_pct(st.daily_vol.get(coin, 0.04), p)
+            if not hit and gain >= tp:
+                urgent.add(coin)
+                st.targets.pop(coin, None)
+                st.cooldown_until[coin] = now + p.take_profit_cooldown_hours * 3600
+                logger.event("decisions", action="take_profit", side=side, coin=coin, price=px,
+                             entry=st.entry_px[coin], gain=round(gain, 4), tp_pct=round(tp, 4))
+                self.log.info("TAKE PROFIT %s %s +%.2f%% (target %.2f%%)", side, coin, gain * 100, tp * 100)
             if hit:
                 urgent.add(coin)
                 st.targets.pop(coin, None)

@@ -202,3 +202,22 @@ def test_backtest_shorts_profit_in_steady_downtrend():
     _, long_only = backtest.run(closes, replace(StrategyParams(), allow_shorts=False))
     assert with_shorts["short_time"] > 0.2
     assert with_shorts["ret"] > long_only["ret"]
+
+
+def test_take_profit_pct():
+    from dataclasses import replace
+    p = StrategyParams()
+    assert strategy.take_profit_pct(0.04, p) == float("inf")          # off by default
+    q = replace(p, take_profit_vol_mult=1.5)
+    assert strategy.take_profit_pct(0.04, q) == pytest.approx(0.06)
+    assert strategy.take_profit_pct(0.001, q) == q.take_profit_min_pct
+
+
+def test_backtest_take_profit_produces_more_smaller_trades():
+    from dataclasses import replace
+    closes = synthetic(n=1800, drift=[0.0005, 0.0004, 0.0006, -0.0005, -0.0004, 0.0], seed=11)
+    _, base = backtest.run(closes, StrategyParams())
+    _, tp = backtest.run(closes, replace(StrategyParams(), take_profit_vol_mult=0.75))
+    assert tp["breakdown"]["take_profit"] > 0
+    assert tp["round_trips"] >= base["round_trips"]
+    assert 0.0 <= tp["win_rate"] <= 1.0

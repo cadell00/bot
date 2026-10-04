@@ -96,7 +96,11 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
     regime_st: dict = {}
     eq_curve, turnover, n_trades, fees_paid, exposure, net_exp = [], 0.0, 0, 0.0, [], []
     short_hours = 0
-    breakdown = {"entry": 0.0, "exit": 0.0, "resize": 0.0, "stop": 0.0}
+    breakdown = {"entry": 0.0, "exit": 0.0, "resize": 0.0, "stop": 0.0, "take_profit": 0.0}
+    entry_px: dict = {}   # coin -> price the current position was opened at
+    trades_ret: list = [] # per round trip, net of fees
+    cur_px: dict = {}
+    tp_set: set = set()
 
     def execute(mask, target, stopped_set=frozenset()):
         nonlocal equity, turnover, n_trades, fees_paid
@@ -105,9 +109,16 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
             return
         for c, d in traded.items():
             flip = w[c] * target[c] < 0
-            kind = ("stop" if c in stopped_set else "entry" if abs(w[c]) <= 1e-4
+            kind = ("take_profit" if c in tp_set else "stop" if c in stopped_set else "entry" if abs(w[c]) <= 1e-4
                     else "exit" if abs(target[c]) <= 1e-9 or flip else "resize")
             breakdown[kind] += abs(d)
+            px = cur_px.get(c)
+            if abs(w[c]) > 1e-4 and (abs(target[c]) <= 1e-9 or flip) and c in entry_px and px:
+                side = 1 if w[c] > 0 else -1
+                trades_ret.append(side * (px / entry_px[c] - 1) - 2 * fee)
+                entry_px.pop(c, None)
+            if abs(target[c]) > 1e-9 and (abs(w[c]) <= 1e-4 or flip) and px:
+                entry_px[c] = px
         cost = float(traded.abs().sum()) * fee
         fees_paid += cost * equity
         equity *= 1 - cost
@@ -130,9 +141,11 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
             wv = w.to_numpy()
         eq_hist.append(equity)
 
-        # trailing stops every hour, both sides
+        # trailing stops and take-profits every hour, both sides
         stopped = set()
+        tp_set = set()
         live = {}
+        cur_px = {cols[j]: PX[i, j] for j in np.nonzero(np.abs(wv) > 1e-6)[0]}
         for j in np.nonzero(np.abs(wv) > 1e-6)[0]:
             c, px, side = cols[j], PX[i, j], 1 if wv[j] > 0 else -1
             live[c] = side
@@ -148,6 +161,10 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
             if hit:
                 stopped.add(c)
                 cooldown[c] = i + p.stop_cooldown_hours
+            elif c in entry_px and side * (px / entry_px[c] - 1) >= strategy.take_profit_pct(DV[i, j], p):
+                stopped.add(c)
+                tp_set.add(c)
+                cooldown[c] = i + p.take_profit_cooldown_hours
         mark = {c: v for c, v in mark.items() if c in live}
         entry_bar = {c: (entry_bar[c] if c in entry_bar and entry_bar[c][1] == s else (i, s))
                      for c, s in live.items() if abs(w[c]) > 1e-4}
@@ -164,6 +181,7 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
                                              held, p, regime, strategy.drawdown_multiplier(dd, p), excluded, locked,
                                              strategy.short_multiplier(name, p), held_short)
             tgt = tgt.reindex(w.index).fillna(0.0)
+            cur_px = {c: PX[i, cols.index(c)] for c in tgt.index[(tgt.abs() > 1e-9) | (w.abs() > 1e-6)]}
             dw = tgt - w
             mask = ((dw.abs() >= band) | ((tgt == 0) & (w.abs() > 1e-4)) | (tgt * w < 0)
                     | dw.index.isin(list(stopped)))
@@ -180,7 +198,11 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
              breakdown={k: round(v, 1) for k, v in breakdown.items()},
              avg_exposure=float(np.mean(exposure)) if exposure else 0.0,
              avg_net=float(np.mean(net_exp)) if net_exp else 0.0,
-             short_time=short_hours / max(len(eq_curve), 1))
+             short_time=short_hours / max(len(eq_curve), 1),
+             round_trips=len(trades_ret),
+             win_rate=float(np.mean([t > 0 for t in trades_ret])) if trades_ret else 0.0,
+             avg_win=float(np.mean([t for t in trades_ret if t > 0])) if any(t > 0 for t in trades_ret) else 0.0,
+             avg_loss=float(np.mean([t for t in trades_ret if t <= 0])) if any(t <= 0 for t in trades_ret) else 0.0)
     return eq, m
 
 
@@ -200,7 +222,8 @@ def _run_split(job) -> dict:
                 h2_ret=second["ret"], h2_comp=second["composite"],
                 worst_half=min(first["composite"], second["composite"]),
                 win14_pos=float((rw.ret > 0).mean()) if not rw.empty else 0.0,
-                win14_med=float(rw.ret.median()) if not rw.empty else 0.0)
+                win14_med=float(rw.ret.median()) if not rw.empty else 0.0,
+                trades_n=m["round_trips"], win_rate=m["win_rate"], avg_win=m["avg_win"], avg_loss=m["avg_loss"])
 
 
 def robust_sweep(closes: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
@@ -231,6 +254,32 @@ def robust_sweep(closes: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
     return df
 
 
+def smallwins_sweep(closes: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
+    """Tests the 'many small 1-2% wins' idea against the current setup on both halves:
+    take-profit levels x fast/intraday horizons x faster rebalancing. tp=0 is the current bot."""
+    split = closes.index[len(closes) // 2]
+    grid = list(itertools.product(
+        [0.0, 0.75, 1.5, 3.0],                              # take-profit, x daily vol (0 = off)
+        [(6, 24, 72), (24, 72, 168), (168, 336, 720)],      # intraday .. 4-week horizons
+        [2, 8],                                             # rebalance every N hours
+    ))
+    jobs = [(closes, replace(p, take_profit_vol_mult=tp, lookbacks=lb, rebalance_every_hours=ev), split)
+            for tp, lb, ev in grid]
+    with ProcessPoolExecutor() as pool:
+        results = list(pool.map(_run_split, jobs))
+    rows = [dict(tp=tp, lookbacks="/".join(str(x) for x in lb), every=ev, **r)
+            for (tp, lb, ev), r in zip(grid, results)]
+    df = pd.DataFrame(rows).sort_values("worst_half", ascending=False)
+    print(f"\nsmall-wins sweep — half 1 ends {split}; ranked by the WORSE half's composite (tp=0 is the current bot)")
+    pd.set_option("display.width", 250)
+    print(df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    print("\nmedian worst-half composite by setting:")
+    for col in ("tp", "lookbacks", "every"):
+        print(" ", df.groupby(col).worst_half.median().round(3).to_dict())
+    df.to_csv("data/smallwins_sweep.csv", index=False)
+    return df
+
+
 def rolling_windows(eq: pd.Series, days: int = 14) -> pd.DataFrame:
     step = days * 24
     out = []
@@ -256,6 +305,8 @@ def main():
     ap.add_argument("--days", type=int, default=180)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--smallwins", action="store_true",
+                    help="test take-profit / intraday variants against the current bot (use with --days 365)")
     ap.add_argument("--robust", action="store_true",
                     help="structural sweep scored on both halves of the data (use with --days 365)")
     ap.add_argument("--plot", action="store_true")
@@ -274,6 +325,8 @@ def main():
           f"avg gross exposure {m['avg_exposure']*100:.0f}%  avg net {m['avg_net']*100:+.0f}%  "
           f"short positions open {m['short_time']*100:.0f}% of the time")
     print(f"                  turnover by cause (x capital): {m['breakdown']}")
+    print(f"                  round trips {m['round_trips']}  win rate {m['win_rate']*100:.0f}%  "
+          f"avg win {m['avg_win']*100:+.2f}%  avg loss {m['avg_loss']*100:+.2f}%  (per trade, net of fees)")
     print("BTC buy & hold  ", fmt(buy_and_hold_btc(closes, eq.index[0])))
     rw = rolling_windows(eq)
     if not rw.empty:
@@ -304,6 +357,8 @@ def main():
 
     if a.robust:
         robust_sweep(closes, p)
+    if a.smallwins:
+        smallwins_sweep(closes, p)
 
     if a.plot:
         import matplotlib.pyplot as plt
