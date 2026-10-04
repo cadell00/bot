@@ -22,6 +22,7 @@ from . import logger, strategy
 from .config import BotConfig
 from .data import MarketData
 from .execution import Executor, parse_rules
+from .notify import Telegram, position_changes
 from .roostoo_client import RoostooClient
 
 
@@ -35,6 +36,7 @@ class Snapshot:
     equity: float
     long_value: float
     short_notional: float
+    positions: dict = field(default_factory=dict)   # coin -> signed qty (long incl. locked; short < 0)
 
 
 @dataclass
@@ -56,6 +58,8 @@ class State:
     squeeze_until: float = 0.0                         # no new shorts until then
     shorts_disabled: bool = False                      # exchange said shorts are not allowed
     entry_px: dict = field(default_factory=dict)       # coin -> price when position was opened (take-profit)
+    start_equity: float = 0.0                          # first equity seen (daily summary)
+    last_summary_day: str = ""
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -90,6 +94,9 @@ class Bot:
         self.md = MarketData(cfg.data_dir)
         if self.state.shorts_disabled:
             cfg.strategy.allow_shorts = False
+        self.notify = Telegram(cfg.telegram_token, cfg.telegram_chat_id,
+                               prefix=f"[{cfg.bot_name}{' DRY' if cfg.dry_run else ''}] ")
+        self._prev_positions: dict | None = None
         self.running = True
         self.log.info("universe (%d): %s | dry_run=%s", len(self.universe), ",".join(self.universe), cfg.dry_run)
         logger.event("decisions", action="startup", universe=self.universe,
@@ -109,7 +116,7 @@ class Bot:
         usd = wallet.get(self.cfg.quote, {})
         usd_free = float(usd.get("Free", 0))
         cash = usd_free + float(usd.get("Lock", 0))
-        holdings, long_value = {}, 0.0
+        holdings, long_value, positions = {}, 0.0, {}
         for coin, w in wallet.items():
             if coin == self.cfg.quote:
                 continue
@@ -117,6 +124,7 @@ class Bot:
             if qty > 0 and coin in book:
                 holdings[coin] = float(w.get("Free", 0))
                 long_value += qty * book[coin]["last"]
+                positions[coin] = qty
         # Short collateral leaves the wallet (short_close returns "collateral + PnL - fee"
         # to it), so each open short adds PositionValue = collateral + unrealised PnL.
         shorts, short_value, short_notional = {}, 0.0, 0.0
@@ -128,6 +136,7 @@ class Bot:
                 qty = float(pos.get("ShortQty", 0))
                 coll = float(pos.get("Collateral", 0))
                 value = float(pos.get("PositionValue", coll + float(pos.get("UnrealizedPNL", 0))))
+                positions[coin] = positions.get(coin, 0.0) - qty
                 shorts[coin] = {"qty": qty, "collateral": coll, "value": value,
                                 "entry": float(pos.get("EntryPrice", 0))}
                 short_value += value
@@ -135,7 +144,7 @@ class Bot:
         except Exception as exc:
             self.log.warning("short_positions failed: %s", exc)
         equity = cash + long_value + short_value
-        return Snapshot(book, holdings, shorts, usd_free, cash, equity, long_value, short_notional)
+        return Snapshot(book, holdings, shorts, usd_free, cash, equity, long_value, short_notional, positions)
 
     # -------------------------------------------------------------- main tick
     def tick(self) -> None:
@@ -145,6 +154,9 @@ class Bot:
         self.md.snapshots.record({c: book[c]["last"] for c in self.universe if c in book})
         st = self.state
         p = self.cfg.strategy
+        self.report_fills(snap)
+        if not st.start_equity:
+            st.start_equity = equity
         st.peak_equity = max(st.peak_equity, equity)
         hour_key = time.strftime("%Y-%m-%dT%H", time.gmtime(now))
         if hour_key != st.equity_hist_hour:
@@ -153,6 +165,7 @@ class Bot:
         dd = strategy.rolling_drawdown(st.equity_hist + [equity], p.dd_lookback_hours)
         gross = (snap.long_value + snap.short_notional) / equity if equity > 0 else 0.0
         logger.equity_row(equity, snap.cash, dd, gross)
+        self.daily_summary(snap, dd, gross)
 
         held = {c for c, q in snap.holdings.items() if q * book[c]["last"] >= self.cfg.min_order_usd}
         held_short = set(snap.shorts)
@@ -172,6 +185,36 @@ class Bot:
             self.trade(st.targets, set(), reason="requote")
         st.save(self.state_path)
 
+    # ------------------------------------------------------------ notifications
+    def report_fills(self, snap: Snapshot) -> None:
+        """Telegram on every fill, detected from the account itself (covers limit orders that
+        fill between loops). The first snapshot after startup only sets the baseline."""
+        prices = {c: b["last"] for c, b in snap.book.items()}
+        if self._prev_positions is None:
+            held = ", ".join(f"{'SHORT' if q < 0 else 'LONG'} {c}" for c, q in sorted(snap.positions.items())
+                             if abs(q) * prices.get(c, 0) >= 25) or "none (all cash)"
+            self.notify.send(f"✅ Bot started. Equity ${snap.equity:,.0f}. Positions: {held}")
+        else:
+            msgs = position_changes(self._prev_positions, snap.positions, prices, self.state.entry_px)
+            if msgs:
+                self.notify.send("\n".join(msgs) + f"\nEquity ${snap.equity:,.0f}")
+        self._prev_positions = dict(snap.positions)
+
+    def daily_summary(self, snap: Snapshot, dd: float, gross: float) -> None:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        st = self.state
+        if day == st.last_summary_day:
+            return
+        first = not st.last_summary_day
+        st.last_summary_day = day
+        if first:
+            return  # no summary on the very first loop; the startup message covers it
+        ret = snap.equity / st.start_equity - 1 if st.start_equity else 0.0
+        pos = ", ".join(f"{'S' if q < 0 else 'L'} {c}" for c, q in sorted(snap.positions.items())
+                        if abs(q) * snap.book.get(c, {}).get("last", 0) >= 25) or "cash"
+        self.notify.send(f"📊 Daily summary {day}\nEquity ${snap.equity:,.0f} ({ret * 100:+.2f}% since start)\n"
+                         f"Drawdown {dd * 100:.2f}% | gross exposure {gross * 100:.0f}%\nPositions: {pos}")
+
     def risk_checks(self, book: dict, held: set, held_short: set, now: float) -> set:
         st, p = self.state, self.cfg.strategy
         urgent = set()
@@ -182,12 +225,14 @@ class Bot:
             urgent |= held
             logger.event("decisions", action="crash_guard", btc_1h=btc_1h, flatten=sorted(held))
             self.log.warning("CRASH GUARD: BTC %.2f%% in 1h -> close longs %s", btc_1h * 100, sorted(held))
+            self.notify.send(f"🚨 Crash guard: BTC {btc_1h * 100:.1f}% in 1h, closing longs {sorted(held)}")
         if btc_1h is not None and btc_1h >= p.squeeze_btc_1h and now >= st.squeeze_until and held_short:
             st.squeeze_until = now + p.crash_cooldown_hours * 3600
             st.targets = {c: w for c, w in st.targets.items() if w > 0}   # keep longs
             urgent |= held_short
             logger.event("decisions", action="squeeze_guard", btc_1h=btc_1h, cover=sorted(held_short))
             self.log.warning("SQUEEZE GUARD: BTC +%.2f%% in 1h -> cover shorts %s", btc_1h * 100, sorted(held_short))
+            self.notify.send(f"🚨 Squeeze guard: BTC +{btc_1h * 100:.1f}% in 1h, covering shorts {sorted(held_short)}")
 
         st.hwm = {c: v for c, v in st.hwm.items() if c in held}
         st.lwm = {c: v for c, v in st.lwm.items() if c in held_short}
@@ -213,6 +258,7 @@ class Bot:
                 logger.event("decisions", action="take_profit", side=side, coin=coin, price=px,
                              entry=st.entry_px[coin], gain=round(gain, 4), tp_pct=round(tp, 4))
                 self.log.info("TAKE PROFIT %s %s +%.2f%% (target %.2f%%)", side, coin, gain * 100, tp * 100)
+                self.notify.send(f"💰 Take-profit {side} {coin}: +{gain * 100:.2f}%")
             if hit:
                 urgent.add(coin)
                 st.targets.pop(coin, None)
@@ -220,6 +266,7 @@ class Bot:
                 logger.event("decisions", action="trailing_stop", side=side, coin=coin, price=px,
                              mark=mark, stop_pct=stop)
                 self.log.warning("STOP %s %s at %.6g (mark %.6g, stop %.1f%%)", side, coin, px, mark, stop * 100)
+                self.notify.send(f"🛑 Trailing stop {side} {coin} at {px:.6g} ({stop * 100:.1f}% from {mark:.6g})")
         return urgent
 
     def rebalance(self, held: set, dd: float, now: float, held_short: set | None = None) -> None:
@@ -250,6 +297,10 @@ class Bot:
         logger.event("decisions", action="rebalance", drawdown=round(dd, 4), held=sorted(held),
                      excluded=sorted(excluded), targets=st.targets, **info)
         self.log.info("rebalance regime=%s targets=%s", info.get("regime"), st.targets)
+        if st.targets != getattr(self, "_last_notified_targets", None):
+            self._last_notified_targets = dict(st.targets)
+            tg = ", ".join(f"{c} {w * 100:+.0f}%" for c, w in sorted(st.targets.items(), key=lambda x: -abs(x[1])))
+            self.notify.send(f"🔄 Rebalance ({info.get('regime')}): {tg or 'all cash'}")
         self.trade(st.targets, set(), reason="rebalance")
 
     def trade(self, targets: dict, urgent: set, reason: str) -> None:
@@ -263,6 +314,7 @@ class Bot:
             self.cfg.strategy.allow_shorts = False
             logger.event("decisions", action="shorts_disabled", reason="exchange rejected short orders")
             self.log.warning("exchange does not allow shorts — continuing long/cash only")
+            self.notify.send("ℹ️ Exchange rejected shorts: continuing long/cash only")
 
     # ------------------------------------------------------------------- loop
     def run(self) -> None:
@@ -275,9 +327,11 @@ class Bot:
             except Exception as exc:
                 self.log.exception("tick failed: %s", exc)
                 logger.event("decisions", action="error", error=str(exc))
+                self.notify.error(type(exc).__name__ + str(exc)[:60], f"{type(exc).__name__}: {str(exc)[:300]}")
             time.sleep(max(1.0, self.cfg.loop_seconds - (time.time() - start)))
         self.state.save(self.state_path)
         self.log.info("bot stopped")
+        self.notify.send("⏹️ Bot stopped (shutdown signal). Positions stay open on the exchange.", sync=True)
 
     def _stop(self, *_):
         self.running = False
@@ -292,7 +346,13 @@ def main(argv=None) -> None:
         cfg.dry_run = True
     if not cfg.api_key or not cfg.secret_key:
         sys.exit("ROOSTOO_API_KEY / ROOSTOO_SECRET_KEY not set (see .env.example)")
-    Bot(cfg).run()
+    try:
+        Bot(cfg).run()
+    except Exception as exc:
+        # last-resort alert if the bot dies outside the per-loop error handling
+        Telegram(cfg.telegram_token, cfg.telegram_chat_id, prefix=f"[{cfg.bot_name}] ").send(
+            f"💥 Bot crashed and exited: {type(exc).__name__}: {str(exc)[:300]}", sync=True)
+        raise
 
 
 if __name__ == "__main__":

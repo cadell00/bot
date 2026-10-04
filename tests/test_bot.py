@@ -221,3 +221,28 @@ def test_backtest_take_profit_produces_more_smaller_trades():
     assert tp["breakdown"]["take_profit"] > 0
     assert tp["round_trips"] >= base["round_trips"]
     assert 0.0 <= tp["win_rate"] <= 1.0
+
+
+def test_position_changes_messages():
+    from bot.notify import position_changes
+    prices = {"BTC": 100.0, "ETH": 10.0, "SOL": 50.0, "DOGE": 1.0}
+    prev = {"BTC": 1.0, "ETH": -100.0, "SOL": 10.0, "DOGE": 5.0}
+    cur = {"ETH": -100.0, "SOL": -10.0, "XRP": 0.0, "DOGE": 5.0}
+    msgs = position_changes(prev, cur, prices, {"BTC": 90.0, "SOL": 40.0})
+    assert any(m.startswith("🔴 Closed LONG BTC") and "+11.11%" in m for m in msgs)
+    assert any(m.startswith("🔴 Closed LONG SOL") for m in msgs)       # flip = close + open
+    assert any(m.startswith("🟢 Opened SHORT SOL") for m in msgs)
+    assert not any("ETH" in m or "DOGE" in m for m in msgs)            # unchanged / tiny -> silent
+
+
+def test_telegram_disabled_is_noop_and_errors_rate_limited():
+    from bot.notify import Telegram
+    sent = []
+    t = Telegram("", "")
+    t._post = sent.append
+    t.send("x", sync=True)
+    assert sent == []
+    t = Telegram("tok", "123", prefix="[b] ")
+    t._post = sent.append
+    t.error("k", "boom"); t.error("k", "boom again"); t.error("other", "x")
+    assert len(sent) == 2 and sent[0] == "[b] ⚠️ Error: boom"

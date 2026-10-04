@@ -115,6 +115,9 @@ class BotConfig:
     history_bars: int = _env("HISTORY_BARS", 1000)  # enough for 720h lookbacks + vol window
     min_request_interval: float = _env("MIN_REQUEST_INTERVAL", 0.35)  # seconds between API calls
     dry_run: bool = _env("DRY_RUN", False)
+    telegram_token: str = _env("TELEGRAM_BOT_TOKEN", "")   # optional notifications
+    telegram_chat_id: str = _env("TELEGRAM_CHAT_ID", "")
+    bot_name: str = _env("BOT_NAME", "roostoo-bot")
     log_dir: str = _env("LOG_DIR", "logs")
     data_dir: str = _env("DATA_DIR", "data")
     strategy: StrategyParams = field(default_factory=StrategyParams)
