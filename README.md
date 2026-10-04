@@ -4,13 +4,13 @@ An autonomous, long-only crypto trading bot for the Roostoo mock exchange. It ho
 
 ## Strategy in one paragraph
 
-Once an hour, after each candle closes, the bot scores about 30 liquid crypto assets on **volatility-normalised time-series momentum** over three horizons: 1, 3 and 7 days. It then takes the following steps:
+Every 4 hours, after the candle closes, the bot scores about 30 liquid crypto assets on **volatility-normalised time-series momentum** over three horizons: 1, 3 and 7 days. It then takes the following steps:
 
-1. It gates total exposure on the **BTC trend regime**.
-2. It picks the top-K assets with **hysteresis**, so positions don't churn back and forth.
+1. It gates total exposure on the **BTC trend regime**, with hysteresis buffers so the regime doesn't flip every hour.
+2. It picks the top-K assets with **rank hysteresis** and a **24-hour minimum hold**, so positions don't churn back and forth.
 3. It weights the picks by conviction divided by volatility.
 4. It scales the whole book to a **2%/day portfolio volatility target**.
-5. It cuts exposure linearly as **drawdown** grows.
+5. It cuts exposure linearly as **drawdown** grows, measured over a 14-day window (the competition length), with a floor so it's never fully locked out of a recovery.
 
 Independently, every minute it runs **volatility-scaled trailing stops** and a **BTC crash guard**. These are market-order exits that don't wait for the next hourly rebalance. Rebalances use passive **limit orders**, which pay the 0.05% maker fee, and changes below a 3%-of-equity band are skipped because the edge is smaller than the cost.
 
@@ -79,8 +79,20 @@ tail -f logs/bot.log
 |---|---|---|
 | `lookbacks` | 24, 72, 168 h | momentum horizons |
 | `top_k` | 4 | max new positions (held positions can stay up to rank 6) |
+| `rebalance_every_hours` | 4 | full retarget cadence (stops still run every minute) |
+| `min_hold_hours` | 24 | no signal-driven exit before this; stops still apply |
 | `target_daily_vol` | 2% | portfolio volatility target |
-| `max_drawdown` | 12% | exposure reaches 0 at this drawdown |
+| `max_drawdown` / `dd_floor_mult` | 10% / 0.25 | exposure shrinks to 25% of normal at 10% drawdown (14-day window) |
+| `regime_price_buffer` / `regime_score_buffer` | 1% / 0.10 | hysteresis on the BTC regime |
 | `stop_vol_mult` | 2.5× daily vol (6–15%) | trailing stop width |
 | `crash_btc_1h` | −4% | flatten everything, 6 h cooldown |
-| `rebalance_band` | 3% of equity | minimum trade size worth paying fees for |
+| `rebalance_band` | 5% of equity | minimum trade size worth paying fees for |
+
+## Backtest findings that shaped v2
+
+The first version made about +14% before fees over 6 months, with a third of BTC's drawdown. But 149x turnover (about 15% in fees) turned that into −1%. Two causes accounted for this:
+
+- **Fee churn.** Hourly retargeting and a regime that flipped near the BTC trend line caused constant trading. The fix was a 4-hour cadence, regime hysteresis, a wider band and a minimum hold.
+- **Drawdown lockout.** An all-time-peak drawdown rule with no floor kept size near zero through the August rally. The fix was a 25% floor and a 14-day window.
+
+`backtest.py` now reports return before fees, fees paid, and turnover broken down by cause (entry, exit, resize, stop), so this kind of problem is visible straight away.
