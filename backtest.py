@@ -78,7 +78,8 @@ def metrics(equity: pd.Series, periods_per_year: float = 24 * 365) -> dict:
 
 def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float | None = None) -> tuple[pd.Series, dict]:
     """Mirror of the live loop: stops every hour, full retarget every `rebalance_every_hours`
-    (on UTC hours divisible by it, as the live bot does)."""
+    (on UTC hours divisible by it, as the live bot does). Weights are signed: a short of
+    weight -w earns -w * return, which matches Roostoo's 1x collateral shorts."""
     band = p.rebalance_band if band is None else band
     closes = closes.ffill(limit=3)
     score, vol = strategy.score_frame(closes, p)
@@ -89,11 +90,12 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
     w = pd.Series(0.0, index=closes.columns)
     equity, gross_equity = 1.0, 1.0
     eq_hist: list = []
-    hwm: dict = {}
-    entry_bar: dict = {}
+    mark: dict = {}       # trailing-stop high-water (longs) / low-water (shorts)
+    entry_bar: dict = {}  # coin -> (bar opened, side)
     cooldown: dict = {}
     regime_st: dict = {}
-    eq_curve, turnover, n_trades, fees_paid, exposure = [], 0.0, 0, 0.0, []
+    eq_curve, turnover, n_trades, fees_paid, exposure, net_exp = [], 0.0, 0, 0.0, [], []
+    short_hours = 0
     breakdown = {"entry": 0.0, "exit": 0.0, "resize": 0.0, "stop": 0.0}
 
     def execute(mask, target, stopped_set=frozenset()):
@@ -102,8 +104,9 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
         if traded.empty:
             return
         for c, d in traded.items():
-            kind = ("stop" if c in stopped_set else "entry" if w[c] <= 1e-4
-                    else "exit" if target[c] <= 1e-9 else "resize")
+            flip = w[c] * target[c] < 0
+            kind = ("stop" if c in stopped_set else "entry" if abs(w[c]) <= 1e-4
+                    else "exit" if abs(target[c]) <= 1e-9 or flip else "resize")
             breakdown[kind] += abs(d)
         cost = float(traded.abs().sum()) * fee
         fees_paid += cost * equity
@@ -127,43 +130,57 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
             wv = w.to_numpy()
         eq_hist.append(equity)
 
-        # trailing stops every hour
+        # trailing stops every hour, both sides
         stopped = set()
-        live = set()
-        for j in np.nonzero(wv > 1e-6)[0]:
-            c, px = cols[j], PX[i, j]
-            live.add(c)
+        live = {}
+        for j in np.nonzero(np.abs(wv) > 1e-6)[0]:
+            c, px, side = cols[j], PX[i, j], 1 if wv[j] > 0 else -1
+            live[c] = side
             if np.isnan(px):
                 continue
-            hwm[c] = max(hwm.get(c, px), px)
-            if px <= hwm[c] * (1 - strategy.trailing_stop_pct(DV[i, j], p)):
+            stop = strategy.trailing_stop_pct(DV[i, j], p)
+            if side > 0:
+                mark[c] = max(mark.get(c, px), px)
+                hit = px <= mark[c] * (1 - stop)
+            else:
+                mark[c] = min(mark.get(c, px), px)
+                hit = px >= mark[c] * (1 + stop)
+            if hit:
                 stopped.add(c)
                 cooldown[c] = i + p.stop_cooldown_hours
-        hwm = {c: v for c, v in hwm.items() if c in live}
-        entry_bar = {c: entry_bar.get(c, i) for c in live if w[c] > 1e-4}
+        mark = {c: v for c, v in mark.items() if c in live}
+        entry_bar = {c: (entry_bar[c] if c in entry_bar and entry_bar[c][1] == s else (i, s))
+                     for c, s in live.items() if abs(w[c]) > 1e-4}
 
         if hours[i] % p.rebalance_every_hours == 0:
-            held = {c for c in w.index if w[c] > 1e-4} - stopped
-            locked = {c for c in held if i - entry_bar.get(c, i) < p.min_hold_hours}
+            held = {c for c, s in live.items() if s > 0 and w[c] > 1e-4} - stopped
+            held_short = {c for c, s in live.items() if s < 0 and w[c] < -1e-4} - stopped
+            locked = {c for c in held | held_short if i - entry_bar.get(c, (i, 0))[0] < p.min_hold_hours}
             excluded = {c for c, until in cooldown.items() if until > i}
             ri = regime_in.iloc[i]
-            regime, _, regime_st = strategy.regime_state(float(ri.px), float(ri.ema), float(ri.score), regime_st, p)
+            regime, name, regime_st = strategy.regime_state(float(ri.px), float(ri.ema), float(ri.score), regime_st, p)
             dd = strategy.rolling_drawdown(eq_hist, p.dd_lookback_hours)
             tgt, _ = strategy.target_weights(score.iloc[i], vol.iloc[i], logret.iloc[max(0, i - p.vol_window): i + 1],
-                                             held, p, regime, strategy.drawdown_multiplier(dd, p), excluded, locked)
+                                             held, p, regime, strategy.drawdown_multiplier(dd, p), excluded, locked,
+                                             strategy.short_multiplier(name, p), held_short)
             tgt = tgt.reindex(w.index).fillna(0.0)
             dw = tgt - w
-            mask = (dw.abs() >= band) | ((tgt == 0) & (w > 1e-4)) | dw.index.isin(list(stopped))
+            mask = ((dw.abs() >= band) | ((tgt == 0) & (w.abs() > 1e-4)) | (tgt * w < 0)
+                    | dw.index.isin(list(stopped)))
             execute(mask, tgt, stopped)
         elif stopped:
             execute(w.index.isin(list(stopped)), pd.Series(0.0, index=w.index), stopped)
-        exposure.append(float(w.sum()))
+        exposure.append(float(w.abs().sum()))
+        net_exp.append(float(w.sum()))
+        short_hours += int((w < -1e-4).any())
         eq_curve.append((closes.index[i], equity))
     eq = pd.Series(dict(eq_curve))
     m = metrics(eq)
     m.update(turnover=turnover, trades=n_trades, gross_ret=gross_equity - 1, fee_drag=fees_paid,
              breakdown={k: round(v, 1) for k, v in breakdown.items()},
-             avg_exposure=float(np.mean(exposure)) if exposure else 0.0)
+             avg_exposure=float(np.mean(exposure)) if exposure else 0.0,
+             avg_net=float(np.mean(net_exp)) if net_exp else 0.0,
+             short_time=short_hours / max(len(eq_curve), 1))
     return eq, m
 
 
@@ -195,19 +212,20 @@ def robust_sweep(closes: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
         [200, 500],                                        # BTC regime EMA (hours)
         [0.5, 0.0],                                        # neutral regime: half size, or cash
         [0.25, 0.40],                                      # entry threshold
+        [True, False],                                     # short book on/off
     ))
-    jobs = [(closes, replace(p, lookbacks=lb, regime_ema=ema, neutral_regime_mult=neu, entry_threshold=ent),
-             split) for lb, ema, neu, ent in grid]
+    jobs = [(closes, replace(p, lookbacks=lb, regime_ema=ema, neutral_regime_mult=neu, entry_threshold=ent,
+                             allow_shorts=sh), split) for lb, ema, neu, ent, sh in grid]
     with ProcessPoolExecutor() as pool:
         results = list(pool.map(_run_split, jobs))
-    rows = [dict(lookbacks="/".join(str(x) for x in lb), regime_ema=ema, neutral=neu, entry=ent, **r)
-            for (lb, ema, neu, ent), r in zip(grid, results)]
+    rows = [dict(lookbacks="/".join(str(x) for x in lb), regime_ema=ema, neutral=neu, entry=ent, shorts=sh, **r)
+            for (lb, ema, neu, ent, sh), r in zip(grid, results)]
     df = pd.DataFrame(rows).sort_values("worst_half", ascending=False)
     print(f"\nrobust sweep — half 1 ends {split}; ranked by the WORSE half's composite")
     pd.set_option("display.width", 250)
     print(df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
     print("\nmedian worst-half composite by setting:")
-    for col in ("lookbacks", "regime_ema", "neutral", "entry"):
+    for col in ("lookbacks", "regime_ema", "neutral", "entry", "shorts"):
         print(" ", df.groupby(col).worst_half.median().round(3).to_dict())
     df.to_csv("data/robust_sweep.csv", index=False)
     return df
@@ -253,7 +271,8 @@ def main():
     eq, m = run(closes, p)
     print("\nSTRATEGY        ", fmt(m), f" trades {m['trades']}  turnover {m['turnover']:.1f}x")
     print(f"                  before fees {m['gross_ret']*100:.2f}%  fees paid {m['fee_drag']*100:.2f}% of capital  "
-          f"avg exposure {m['avg_exposure']*100:.0f}%")
+          f"avg gross exposure {m['avg_exposure']*100:.0f}%  avg net {m['avg_net']*100:+.0f}%  "
+          f"short positions open {m['short_time']*100:.0f}% of the time")
     print(f"                  turnover by cause (x capital): {m['breakdown']}")
     print("BTC buy & hold  ", fmt(buy_and_hold_btc(closes, eq.index[0])))
     rw = rolling_windows(eq)

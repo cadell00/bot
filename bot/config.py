@@ -70,6 +70,14 @@ class StrategyParams:
     regime_score_smooth: int = _env("REGIME_SCORE_SMOOTH", 12)     # EMA span on BTC score (hours)
     regime_price_buffer: float = _env("REGIME_PRICE_BUFFER", 0.01)  # 1% hysteresis around BTC EMA
     regime_score_buffer: float = _env("REGIME_SCORE_BUFFER", 0.10)  # hysteresis around score 0
+    # --- short book (Roostoo /v6 shorts: 1x collateral, 0.1% fee on open and close) ---
+    allow_shorts: bool = _env("ALLOW_SHORTS", True)
+    short_top_k: int = _env("SHORT_TOP_K", 3)
+    short_entry_threshold: float = _env("SHORT_ENTRY_THRESHOLD", 0.30)  # on -score
+    short_exit_threshold: float = _env("SHORT_EXIT_THRESHOLD", 0.05)
+    short_max_weight: float = _env("SHORT_MAX_WEIGHT", 0.25)
+    short_neutral_mult: float = _env("SHORT_NEUTRAL_MULT", 0.0)        # shorts only in risk-off
+    squeeze_btc_1h: float = _env("SQUEEZE_BTC_1H", 0.04)   # BTC +4% in 1h -> close all shorts
     # --- risk ---
     max_drawdown: float = _env("MAX_DRAWDOWN", 0.08)   # exposure -> floor as rolling DD approaches this
     dd_floor_mult: float = _env("DD_FLOOR_MULT", 0.25)  # never fully locked out of a recovery

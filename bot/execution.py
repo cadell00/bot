@@ -6,6 +6,11 @@ Cost-aware by design (0.1% taker vs 0.05% maker):
   * a limit that has not filled after N re-quotes falls back to MARKET;
   * risk exits (stops, crash guard, full exits flagged urgent) go MARKET immediately.
 Sells are sent before buys so freed cash can fund new positions.
+
+Shorts use Roostoo's /v6 endpoints: opened at market with USD collateral equal to the
+target notional (1x, no leverage), reduced/closed with reduce-only short_close. The short
+fee is 0.1% either way, so there is no limit-order variant. If the exchange answers that
+shorts are not allowed, the executor sets `shorts_disabled` and the bot goes long/cash.
 """
 from __future__ import annotations
 
@@ -51,6 +56,7 @@ class Executor:
         self.client = client
         self.cfg = cfg
         self.rules = rules
+        self.shorts_disabled = False
 
     def pair(self, coin: str) -> str:
         return f"{coin}/{self.cfg.quote}"
@@ -96,62 +102,139 @@ class Executor:
             log.warning("order rejected %s %s %s: %s", side, q_str, pair, res.get("ErrMsg"))
         return res
 
+    # ------------------------------------------------------------------ shorts
+    def _short(self, action: str, coin: str, reason: str, collateral: float = 0.0,
+               qty: float | None = None, ref_px: float = 0.0) -> dict | None:
+        """action: 'open' (sized by USD collateral) or 'close' (qty=None closes all)."""
+        pair = self.pair(coin)
+        rule = self.rules[pair]
+        rec = dict(action=f"short_{action}", pair=pair, reason=reason, dry_run=self.cfg.dry_run)
+        if action == "open":
+            if collateral < max(self.cfg.min_order_usd, 1.0):
+                return None
+            rec["collateral"] = c_str = f"{floor_to(collateral, 2):.2f}"
+        else:
+            q_str = None
+            if qty is not None:
+                qty = floor_to(qty, rule.amount_precision)
+                if qty <= 0 or qty * ref_px < 1.0:
+                    return None
+                q_str = fmt(qty, rule.amount_precision)
+            rec["close_qty"] = q_str or "ALL"
+        if self.cfg.dry_run:
+            logger.event("trades", **rec)
+            log.info("[DRY] SHORT_%s %s %s (%s)", action.upper(), pair, rec.get("collateral") or rec.get("close_qty"), reason)
+            return {"Success": True, "dry_run": True}
+        try:
+            res = (self.client.short_open(pair, c_str) if action == "open"
+                   else self.client.short_close(pair, close_qty=q_str))
+        except Exception as exc:
+            res = {"Success": False, "ErrMsg": str(exc)}
+        rec["response"] = res
+        logger.event("trades", **rec)
+        if res.get("Success"):
+            log.info("SHORT_%s %s %s (%s) -> %s", action.upper(), pair, rec.get("collateral") or rec.get("close_qty"),
+                     reason, {k: res.get(k) for k in ("EntryPrice", "ShortQty", "ClosePrice", "RealizedPNL") if k in res})
+        else:
+            err = str(res.get("ErrMsg", ""))
+            log.warning("short %s rejected %s: %s", action, pair, err)
+            if "not allow short" in err.lower() or "permission" in err.lower():
+                self.shorts_disabled = True
+        return res
+
+    # --------------------------------------------------------------- rebalance
     def rebalance(self, targets: pd.Series, holdings: dict[str, float], usd_free: float, equity: float,
                   book: dict[str, dict], attempts: dict[str, int], urgent: set | None = None,
-                  reason: str = "rebalance") -> list:
-        """targets: coin -> weight of equity. holdings: coin -> free quantity.
+                  reason: str = "rebalance", shorts: dict[str, dict] | None = None) -> list:
+        """targets: coin -> SIGNED weight of equity (negative = short).
+        holdings: coin -> free spot quantity. shorts: coin -> {'qty', 'collateral'}.
         book: coin -> {'bid','ask','last'}. attempts is mutated (limit re-quote counter)."""
         urgent = urgent or set()
+        shorts = shorts or {}
         band = self.cfg.strategy.rebalance_band
-        sells, buys = [], []
-        coins = set(targets.index) | {c for c, q in holdings.items() if q > 0}
+        fee = self.cfg.strategy.taker_fee
+        reduce_long, add_long, reduce_short, add_short = [], [], [], []
+        coins = set(targets.index) | {c for c, q in holdings.items() if q > 0} | set(shorts)
         for coin in coins:
             if self.pair(coin) not in self.rules or coin not in book:
                 continue
             px = book[coin]["last"]
-            cur_val = holdings.get(coin, 0.0) * px
-            tgt_w = float(targets.get(coin, 0.0))
-            tgt_val = tgt_w * equity
-            diff = tgt_val - cur_val
-            full_exit = tgt_w <= 0 and cur_val >= max(self.rules[self.pair(coin)].min_notional, 1.0) * 2
-            if not full_exit and (abs(diff) / max(equity, 1) < band or abs(diff) < self.cfg.min_order_usd):
+            tgt = float(targets.get(coin, 0.0))
+            long_val = holdings.get(coin, 0.0) * px
+            sh = shorts.get(coin)
+            short_val = sh["qty"] * px if sh else 0.0
+            min_val = max(self.rules[self.pair(coin)].min_notional, 1.0) * 2
+
+            # ---- short side: close / reduce / grow
+            if sh and tgt >= 0:
+                reduce_short.append((coin, None))                      # close the whole short
+            elif tgt < 0:
+                tgt_val = -tgt * equity
+                diff = tgt_val - short_val
+                if abs(diff) / max(equity, 1) >= band and abs(diff) >= self.cfg.min_order_usd:
+                    if diff > 0:
+                        add_short.append((coin, diff))
+                    elif sh:
+                        reduce_short.append((coin, sh["qty"] * min(1.0, -diff / short_val)))
+
+            # ---- long side
+            if tgt <= 0:
+                if long_val >= min_val and (long_val >= self.cfg.min_order_usd or coin in urgent):
+                    # flips (long -> short) and urgent exits go at market
+                    reduce_long.append((coin, holdings[coin], True, tgt < 0 or coin in urgent))
+                elif coin in attempts and long_val < min_val:
+                    attempts.pop(coin, None)
+                continue
+            diff = tgt * equity - long_val
+            if abs(diff) / max(equity, 1) < band or abs(diff) < self.cfg.min_order_usd:
                 attempts.pop(coin, None)
                 continue
-            if full_exit and cur_val < self.cfg.min_order_usd and coin not in urgent:
-                continue  # dust, not worth a fee
-            (sells if diff < 0 else buys).append((coin, diff, full_exit))
+            if diff < 0:
+                reduce_long.append((coin, min(-diff / px, holdings.get(coin, 0.0)), False, coin in urgent))
+            else:
+                add_long.append((coin, diff))
 
         results = []
-        for coin, diff, full_exit in sells:
+        # 1) reductions first: they free cash
+        for coin, qty in reduce_short:
+            res = self._short("close", coin, reason + (":urgent" if coin in urgent else ""), qty=qty,
+                              ref_px=book[coin]["last"])
+            if res and res.get("Success"):
+                usd_free += float(res.get("ReturnAmount", 0.0))
+            results.append((coin, "SHORT_CLOSE", res))
+        for coin, qty, full_exit, force_market in reduce_long:
             b = book[coin]
-            qty = holdings.get(coin, 0.0) if full_exit else min(-diff / b["last"], holdings.get(coin, 0.0))
-            market = coin in urgent or attempts.get(coin, 0) >= self.cfg.max_limit_attempts
+            market = force_market or attempts.get(coin, 0) >= self.cfg.max_limit_attempts
             if market:
-                res = self._send(coin, "SELL", qty, "MARKET", b["bid"], reason + (":urgent" if coin in urgent else ":fallback"))
+                res = self._send(coin, "SELL", qty, "MARKET", b["bid"], reason + (":urgent" if coin in urgent else ":market"))
+                if res and res.get("Success"):
+                    usd_free += qty * b["bid"] * (1 - fee)
+                    attempts.pop(coin, None)
             else:
                 res = self._send(coin, "SELL", qty, "LIMIT", b["ask"], reason)
                 attempts[coin] = attempts.get(coin, 0) + 1
-            if res and res.get("Success") and market:
-                usd_free += qty * b["bid"] * (1 - self.cfg.strategy.taker_fee)
-                attempts.pop(coin, None)
             results.append((coin, "SELL", res))
 
+        # 2) additions, largest first, within free cash
         budget = usd_free * 0.995
-        for coin, diff, _ in sorted(buys, key=lambda x: -x[1]):
+        adds = [("long", c, d) for c, d in add_long] + [("short", c, d) for c, d in add_short]
+        for kind, coin, diff in sorted(adds, key=lambda x: -x[2]):
             b = book[coin]
-            spend = min(diff, budget)
+            spend = min(diff, budget / (1 + fee))
             if spend < self.cfg.min_order_usd:
                 continue
-            market = attempts.get(coin, 0) >= self.cfg.max_limit_attempts
-            if market:
-                qty = spend / (b["ask"] * (1 + self.cfg.strategy.taker_fee))
-                res = self._send(coin, "BUY", qty, "MARKET", b["ask"], reason + ":fallback")
+            if kind == "short":
+                if self.shorts_disabled:
+                    continue
+                res = self._short("open", coin, reason, collateral=spend)
+            elif attempts.get(coin, 0) >= self.cfg.max_limit_attempts:
+                res = self._send(coin, "BUY", spend / (b["ask"] * (1 + fee)), "MARKET", b["ask"], reason + ":fallback")
                 attempts.pop(coin, None)
             else:
-                qty = spend / (b["bid"] * (1 + self.cfg.strategy.maker_fee))
-                res = self._send(coin, "BUY", qty, "LIMIT", b["bid"], reason)
+                res = self._send(coin, "BUY", spend / (b["bid"] * (1 + self.cfg.strategy.maker_fee)), "LIMIT",
+                                 b["bid"], reason)
                 attempts[coin] = attempts.get(coin, 0) + 1
             if res and res.get("Success"):
-                budget -= spend
-            results.append((coin, "BUY", res))
+                budget -= spend * (1 + fee)
+            results.append((coin, "SHORT_OPEN" if kind == "short" else "BUY", res))
         return results

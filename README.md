@@ -1,18 +1,18 @@
-# Roostoo Regime-Gated Momentum Bot
+# Roostoo Regime-Switching Long/Short Momentum Bot
 
 An autonomous, long-only crypto trading bot for the Roostoo mock exchange. It holds the strongest few crypto trends, sizes them by risk, and moves to cash when the market regime turns. It is built to score well on the competition's risk-adjusted metric: 0.4·Sortino + 0.3·Sharpe + 0.3·Calmar.
 
 ## Strategy in one paragraph
 
-Every 8 hours (00:00, 08:00 and 16:00 UTC), after the candle closes, the bot scores about 30 liquid crypto assets on **volatility-normalised time-series momentum** over three horizons: 1, 3 and 7 days. It then takes the following steps:
+Every 8 hours (00:00, 08:00 and 16:00 UTC), after the candle closes, the bot scores about 30 liquid crypto assets on **volatility-normalised time-series momentum**. It then switches its book on the **BTC trend regime**, which uses hysteresis buffers so it doesn't flip every hour:
 
-1. It gates total exposure on the **BTC trend regime**, with hysteresis buffers so the regime doesn't flip every hour.
-2. It picks the top-K assets with **rank hysteresis** and a **24-hour minimum hold**, so positions don't churn back and forth.
-3. It weights the picks by conviction divided by volatility.
-4. It scales the whole book to a **3%/day portfolio volatility target**.
-5. It cuts exposure linearly as **drawdown** grows, measured over a 14-day window (the competition length), with a floor so it's never fully locked out of a recovery.
+- **Risk-on:** it holds **long** spot positions in the strongest uptrends (top 4).
+- **Risk-off:** it holds **short** positions in the weakest downtrends (bottom 3), using Roostoo's 1x-collateral short API.
+- **Neutral:** it holds half-size longs and no shorts.
 
-Independently, every minute it runs **volatility-scaled trailing stops** and a **BTC crash guard**. These are market-order exits that don't wait for the next hourly rebalance. Rebalances use passive **limit orders**, which pay the 0.05% maker fee, and changes below a 3%-of-equity band are skipped because the edge is smaller than the cost.
+Each book is weighted by conviction divided by volatility and scaled to a **3%/day volatility target**. Exposure shrinks as **drawdown** grows, measured over 14 days with a floor. Rank and threshold hysteresis plus a **24-hour minimum hold** keep turnover down. Gross exposure is capped at 95%, so there's no leverage.
+
+Every minute, independently of the rebalance schedule, it runs **volatility-scaled trailing stops** on both sides, a **crash guard** (BTC −4% in an hour closes all longs) and a **squeeze guard** (BTC +4% in an hour covers all shorts). Spot rebalances use maker limit orders. Short fees are 0.1% either way, so shorts are opened and closed at market. If the exchange ever rejects shorts as not allowed, the bot records that and continues long-or-cash only.
 
 ## Why this design
 
@@ -21,7 +21,7 @@ Independently, every minute it runs **volatility-scaled trailing stops** and a *
 | Ranked first on return (top 20), then on Sortino/Sharpe/Calmar | Fully invested only in confirmed up-trends, otherwise cash. Cash has zero downside volatility, which helps Sortino and Calmar. |
 | 0.1% taker / 0.05% maker fees | Hourly cadence, a rebalance band, hysteresis, and maker-first execution with a market fallback |
 | No HFT / excessive requests | About 2 API calls per minute, with client-side throttling and backoff |
-| Spot only, no leverage | Long-only. Gross exposure is capped at 95%. |
+| 1x long and short, no leverage | Shorts are sized with collateral equal to their notional. Gross long plus short exposure is capped at 95%. |
 | Log integrity and commit transparency | Every API call, decision and order goes to append-only JSONL logs. Parameters live in `bot/config.py`, so every change goes through git. |
 
 ### Research basis
@@ -78,7 +78,10 @@ tail -f logs/bot.log
 | Param | Default | Meaning |
 |---|---|---|
 | `lookbacks` | 24, 72, 168 h | momentum horizons |
-| `top_k` | 4 | max new positions (held positions can stay up to rank 6) |
+| `top_k` | 4 | max new long positions (held positions can stay up to rank 6) |
+| `allow_shorts` / `short_top_k` | on / 3 | short book in risk-off regimes |
+| `short_entry_threshold` / `short_max_weight` | 0.30 / 25% | how weak an asset must be to short, and the per-short size cap |
+| `squeeze_btc_1h` | +4% | cover all shorts, 6 h cooldown |
 | `rebalance_every_hours` | 8 | full retarget cadence (stops still run every minute) |
 | `min_hold_hours` | 24 | no signal-driven exit before this; stops still apply |
 | `target_daily_vol` | 3% | portfolio volatility target |
@@ -102,3 +105,7 @@ The first version made about +14% before fees over 6 months, with a third of BTC
 A 72-setting sweep over 6 months of hourly data was profitable in every configuration: +13% to +45%, with 8.5–15% max drawdown. Defaults were set to the best value of each parameter **by median composite across the whole grid**, not to the single best row, to limit overfitting: top_k 4, 3% daily volatility target, 8% drawdown limit, 8-hour rebalances, 24-hour minimum hold. That combination returned +40.2% with an 11.2% max drawdown in-sample.
 
 These figures are in-sample, because the same period informed the v2 fixes. Check them out of sample with `python backtest.py --days 365 --until 2026-04-15`.
+
+## Out-of-sample finding and the short book (v4)
+
+On October 2025 to April 2026, which wasn't used in any design decision, the long-only version lost 17.2% (−11.4% before fees) while BTC fell 34%. Only 20% of 14-day windows were positive. Long-only momentum can only sit in cash during a bear market, and short-horizon signals kept buying rallies that failed. The competition allows shorts, so v4 adds a symmetric short book for risk-off regimes. `python backtest.py --days 365 --robust` judges every structural choice, including shorts on or off, on its worse half (bear or bull).

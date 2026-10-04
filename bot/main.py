@@ -26,6 +26,18 @@ from .roostoo_client import RoostooClient
 
 
 @dataclass
+class Snapshot:
+    book: dict
+    holdings: dict       # coin -> free spot qty
+    shorts: dict         # coin -> {qty, collateral, value, entry}
+    usd_free: float
+    cash: float
+    equity: float
+    long_value: float
+    short_notional: float
+
+
+@dataclass
 class State:
     peak_equity: float = 0.0
     last_rebalance_hour: str = ""
@@ -40,6 +52,9 @@ class State:
     equity_hist_hour: str = ""
     regime: dict = field(default_factory=dict)         # hysteresis state of the BTC regime
     entry_ts: dict = field(default_factory=dict)       # coin -> unix ts when position was opened
+    lwm: dict = field(default_factory=dict)            # trailing-stop low-water marks (shorts)
+    squeeze_until: float = 0.0                         # no new shorts until then
+    shorts_disabled: bool = False                      # exchange said shorts are not allowed
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -71,13 +86,15 @@ class Bot:
         self.universe = [c for c in cfg.universe if f"{c}/{cfg.quote}" in self.rules]
         self.exec = Executor(self.client, cfg, self.rules)
         self.md = MarketData(cfg.data_dir)
+        if self.state.shorts_disabled:
+            cfg.strategy.allow_shorts = False
         self.running = True
         self.log.info("universe (%d): %s | dry_run=%s", len(self.universe), ",".join(self.universe), cfg.dry_run)
         logger.event("decisions", action="startup", universe=self.universe,
                      params=asdict(cfg.strategy), dry_run=cfg.dry_run)
 
     # --------------------------------------------------------------- snapshot
-    def snapshot(self):
+    def snapshot(self) -> Snapshot:
         t = self.client.ticker()
         book = {}
         for pair, d in (t.get("Data") or {}).items():
@@ -89,21 +106,40 @@ class Bot:
         wallet = bal.get("Wallet") or bal.get("SpotWallet") or {}
         usd = wallet.get(self.cfg.quote, {})
         usd_free = float(usd.get("Free", 0))
-        usd_total = usd_free + float(usd.get("Lock", 0))
-        holdings, equity = {}, usd_total
+        cash = usd_free + float(usd.get("Lock", 0))
+        holdings, long_value = {}, 0.0
         for coin, w in wallet.items():
             if coin == self.cfg.quote:
                 continue
             qty = float(w.get("Free", 0)) + float(w.get("Lock", 0))
             if qty > 0 and coin in book:
                 holdings[coin] = float(w.get("Free", 0))
-                equity += qty * book[coin]["last"]
-        return book, holdings, usd_free, usd_total, equity
+                long_value += qty * book[coin]["last"]
+        # Short collateral leaves the wallet (short_close returns "collateral + PnL - fee"
+        # to it), so each open short adds PositionValue = collateral + unrealised PnL.
+        shorts, short_value, short_notional = {}, 0.0, 0.0
+        # always read positions, so shorts opened earlier are still valued and managed
+        try:
+            res = self.client.short_positions()
+            for pos in res.get("Positions") or []:
+                coin = pos["Pair"].split("/")[0]
+                qty = float(pos.get("ShortQty", 0))
+                coll = float(pos.get("Collateral", 0))
+                value = float(pos.get("PositionValue", coll + float(pos.get("UnrealizedPNL", 0))))
+                shorts[coin] = {"qty": qty, "collateral": coll, "value": value,
+                                "entry": float(pos.get("EntryPrice", 0))}
+                short_value += value
+                short_notional += qty * book.get(coin, {}).get("last", float(pos.get("CurrentPrice", 0)))
+        except Exception as exc:
+            self.log.warning("short_positions failed: %s", exc)
+        equity = cash + long_value + short_value
+        return Snapshot(book, holdings, shorts, usd_free, cash, equity, long_value, short_notional)
 
     # -------------------------------------------------------------- main tick
     def tick(self) -> None:
         now = time.time()
-        book, holdings, usd_free, cash, equity = self.snapshot()
+        snap = self.snapshot()
+        book, equity = snap.book, snap.equity
         self.md.snapshots.record({c: book[c]["last"] for c in self.universe if c in book})
         st = self.state
         p = self.cfg.strategy
@@ -113,52 +149,68 @@ class Bot:
             st.equity_hist = (st.equity_hist + [round(equity, 2)])[-(p.dd_lookback_hours + 5):]
             st.equity_hist_hour = hour_key
         dd = strategy.rolling_drawdown(st.equity_hist + [equity], p.dd_lookback_hours)
-        exposure = 1 - cash / equity if equity > 0 else 0.0
-        logger.equity_row(equity, cash, dd, exposure)
+        gross = (snap.long_value + snap.short_notional) / equity if equity > 0 else 0.0
+        logger.equity_row(equity, snap.cash, dd, gross)
 
-        held = {c for c, q in holdings.items() if q * book[c]["last"] >= self.cfg.min_order_usd}
-        urgent = self.risk_checks(book, held, now)
+        held = {c for c, q in snap.holdings.items() if q * book[c]["last"] >= self.cfg.min_order_usd}
+        held_short = set(snap.shorts)
+        urgent = self.risk_checks(book, held, held_short, now)
         if urgent:
             self.trade(st.targets, urgent, reason="risk_exit")
-            book, holdings, usd_free, cash, equity = self.snapshot()
+            snap = self.snapshot()
+            held = {c for c, q in snap.holdings.items() if q * snap.book[c]["last"] >= self.cfg.min_order_usd}
+            held_short = set(snap.shorts)
 
         gm = time.gmtime(now)
         on_schedule = gm.tm_hour % p.rebalance_every_hours == 0 or not st.last_rebalance_hour
         if hour_key != st.last_rebalance_hour and gm.tm_min >= self.cfg.rebalance_minute and on_schedule:
-            self.rebalance(held, dd, now)
+            self.rebalance(held, dd, now, held_short)
             st.last_rebalance_hour = hour_key
         elif st.attempts and now - st.last_order_ts >= self.cfg.retry_minutes * 60:
             self.trade(st.targets, set(), reason="requote")
         st.save(self.state_path)
 
-    def risk_checks(self, book: dict, held: set, now: float) -> set:
+    def risk_checks(self, book: dict, held: set, held_short: set, now: float) -> set:
         st, p = self.state, self.cfg.strategy
         urgent = set()
         btc_1h = self.md.snapshots.return_over("BTC", 60)
-        if btc_1h is not None and btc_1h <= p.crash_btc_1h and now >= st.crash_until:
+        if btc_1h is not None and btc_1h <= p.crash_btc_1h and now >= st.crash_until and held:
             st.crash_until = now + p.crash_cooldown_hours * 3600
-            st.targets = {}
+            st.targets = {c: w for c, w in st.targets.items() if w < 0}   # keep shorts
             urgent |= held
             logger.event("decisions", action="crash_guard", btc_1h=btc_1h, flatten=sorted(held))
-            self.log.warning("CRASH GUARD: BTC %.2f%% in 1h -> flatten %s", btc_1h * 100, sorted(held))
-        for coin in list(st.hwm):
-            if coin not in held:
-                st.hwm.pop(coin)
-        st.entry_ts = {c: st.entry_ts.get(c, now) for c in held}
-        for coin in held:
+            self.log.warning("CRASH GUARD: BTC %.2f%% in 1h -> close longs %s", btc_1h * 100, sorted(held))
+        if btc_1h is not None and btc_1h >= p.squeeze_btc_1h and now >= st.squeeze_until and held_short:
+            st.squeeze_until = now + p.crash_cooldown_hours * 3600
+            st.targets = {c: w for c, w in st.targets.items() if w > 0}   # keep longs
+            urgent |= held_short
+            logger.event("decisions", action="squeeze_guard", btc_1h=btc_1h, cover=sorted(held_short))
+            self.log.warning("SQUEEZE GUARD: BTC +%.2f%% in 1h -> cover shorts %s", btc_1h * 100, sorted(held_short))
+
+        st.hwm = {c: v for c, v in st.hwm.items() if c in held}
+        st.lwm = {c: v for c, v in st.lwm.items() if c in held_short}
+        st.entry_ts = {c: st.entry_ts.get(c, now) for c in held | held_short}
+        for coin in held | held_short:
+            if coin in urgent or coin not in book:
+                continue
             px = book[coin]["last"]
-            st.hwm[coin] = max(st.hwm.get(coin, px), px)
             stop = strategy.trailing_stop_pct(st.daily_vol.get(coin, 0.04), p)
-            if px <= st.hwm[coin] * (1 - stop) and coin not in urgent:
+            if coin in held:
+                st.hwm[coin] = max(st.hwm.get(coin, px), px)
+                hit, mark, side = px <= st.hwm[coin] * (1 - stop), st.hwm[coin], "long"
+            else:
+                st.lwm[coin] = min(st.lwm.get(coin, px), px)
+                hit, mark, side = px >= st.lwm[coin] * (1 + stop), st.lwm[coin], "short"
+            if hit:
                 urgent.add(coin)
                 st.targets.pop(coin, None)
                 st.cooldown_until[coin] = now + p.stop_cooldown_hours * 3600
-                logger.event("decisions", action="trailing_stop", coin=coin, price=px,
-                             hwm=st.hwm[coin], stop_pct=stop)
-                self.log.warning("STOP %s at %.6g (hwm %.6g, stop %.1f%%)", coin, px, st.hwm[coin], stop * 100)
+                logger.event("decisions", action="trailing_stop", side=side, coin=coin, price=px,
+                             mark=mark, stop_pct=stop)
+                self.log.warning("STOP %s %s at %.6g (mark %.6g, stop %.1f%%)", side, coin, px, mark, stop * 100)
         return urgent
 
-    def rebalance(self, held: set, dd: float, now: float) -> None:
+    def rebalance(self, held: set, dd: float, now: float, held_short: set | None = None) -> None:
         st, p = self.state, self.cfg.strategy
         closes = self.md.hourly_closes(self.universe, self.cfg.history_bars)
         min_bars = max(max(p.lookbacks), p.vol_window // 2) + 2
@@ -173,12 +225,16 @@ class Bot:
         if now < st.crash_until:
             w, info = pd.Series(dtype=float), {"regime": "crash_cooldown"}
         else:
-            locked = {c for c in held if now - st.entry_ts.get(c, now) < p.min_hold_hours * 3600}
-            w, info = strategy.decide(closes, held, p, dd, excluded, st.regime, locked)
+            held_short = held_short or set()
+            locked = {c for c in held | held_short if now - st.entry_ts.get(c, now) < p.min_hold_hours * 3600}
+            w, info = strategy.decide(closes, held, p, dd, excluded, st.regime, locked, held_short)
             info["locked"] = sorted(locked)
             st.regime = info.pop("regime_state", st.regime)
+        if now < st.squeeze_until:
+            w = w[w > 0]
+            info["squeeze_cooldown"] = True
         st.daily_vol = info.pop("daily_vol", st.daily_vol)
-        st.targets = {k: round(float(v), 5) for k, v in w.items() if v > 0}
+        st.targets = {k: round(float(v), 5) for k, v in w.items() if abs(v) > 0}
         logger.event("decisions", action="rebalance", drawdown=round(dd, 4), held=sorted(held),
                      excluded=sorted(excluded), targets=st.targets, **info)
         self.log.info("rebalance regime=%s targets=%s", info.get("regime"), st.targets)
@@ -186,10 +242,15 @@ class Bot:
 
     def trade(self, targets: dict, urgent: set, reason: str) -> None:
         self.exec.cancel_all()
-        book, holdings, usd_free, _, equity = self.snapshot()
-        self.exec.rebalance(pd.Series(targets, dtype=float), holdings, usd_free, equity, book,
-                            self.state.attempts, urgent, reason)
+        snap = self.snapshot()
+        self.exec.rebalance(pd.Series(targets, dtype=float), snap.holdings, snap.usd_free, snap.equity,
+                            snap.book, self.state.attempts, urgent, reason, snap.shorts)
         self.state.last_order_ts = time.time()
+        if self.exec.shorts_disabled and not self.state.shorts_disabled:
+            self.state.shorts_disabled = True
+            self.cfg.strategy.allow_shorts = False
+            logger.event("decisions", action="shorts_disabled", reason="exchange rejected short orders")
+            self.log.warning("exchange does not allow shorts — continuing long/cash only")
 
     # ------------------------------------------------------------------- loop
     def run(self) -> None:
@@ -211,7 +272,7 @@ class Bot:
 
 
 def main(argv=None) -> None:
-    ap = argparse.ArgumentParser(description="Roostoo regime-gated momentum bot")
+    ap = argparse.ArgumentParser(description="Roostoo regime-switching long/short momentum bot")
     ap.add_argument("--dry-run", action="store_true", help="log decisions, place no orders")
     args = ap.parse_args(argv)
     cfg = BotConfig()

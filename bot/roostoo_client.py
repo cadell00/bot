@@ -150,3 +150,20 @@ class RoostooClient:
         elif pair:
             params["pair"] = pair
         return self._request("POST", "/v3/cancel_order", params, signed=True)
+
+    # ---------------------------------------------------------------- shorts (/v6)
+    def short_open(self, pair: str, collateral: str) -> dict:
+        """Market short sized by USD collateral (qty = collateral / entry price, 1x)."""
+        return self._request("POST", "/v6/short_open", {"pair": pair, "collateral": collateral}, signed=True)
+
+    def short_close(self, pair: str, close_qty: str | None = None, close_pct: str | None = None) -> dict:
+        """Reduce-only close at MinAsk. No size = close the whole position."""
+        params: dict[str, Any] = {"pair": pair}
+        if close_qty is not None:
+            params["close_qty"] = close_qty
+        elif close_pct is not None:
+            params["close_pct"] = close_pct
+        return self._request("POST", "/v6/short_close", params, signed=True)
+
+    def short_positions(self) -> dict:
+        return self._request("GET", "/v6/short_positions", signed=True)

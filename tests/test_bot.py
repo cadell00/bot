@@ -46,12 +46,31 @@ def test_weights_long_only_capped_no_leverage():
     assert info["regime"] == "risk_on"
 
 
-def test_risk_off_goes_to_cash():
-    p = StrategyParams()
+def test_risk_off_without_shorts_goes_to_cash():
+    from dataclasses import replace
+    p = replace(StrategyParams(), allow_shorts=False)
     closes = synthetic(drift=[-0.001] * 6)
     w, info = strategy.decide(closes, {"ETH"}, p)
-    assert w.empty or w.sum() == 0
+    assert w.empty or (w == 0).all()
     assert info["regime"] == "risk_off"
+
+
+def test_risk_off_with_shorts_goes_short_no_leverage():
+    p = StrategyParams()
+    closes = synthetic(drift=[-0.001, -0.0012, -0.0008, -0.0011, -0.0009, -0.001])
+    w, info = strategy.decide(closes, set(), p)
+    assert info["regime"] == "risk_off"
+    assert len(w) and (w < 0).all()
+    assert w.abs().sum() <= p.gross_cap + 1e-9
+    assert (w.abs() <= p.short_max_weight + 1e-9).all()
+    assert len(w) <= p.short_top_k + 1
+
+
+def test_risk_on_has_no_shorts():
+    p = StrategyParams()
+    closes = synthetic(drift=[0.001, 0.0008, 0.0012, 0.0006, 0.0009, 0.0007])
+    w, info = strategy.decide(closes, set(), p)
+    assert (w >= 0).all()
 
 
 def test_drawdown_multiplier_has_floor():
@@ -83,12 +102,64 @@ def test_regime_hysteresis_does_not_flip_near_ema():
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, allow_shorts=True):
         self.orders = []
+        self.allow_shorts = allow_shorts
 
     def place_order(self, pair, side, qty, order_type, price):
         self.orders.append((pair, side, qty, order_type, price))
         return {"Success": True, "OrderDetail": {"Status": "FILLED" if order_type == "MARKET" else "PENDING"}}
+
+    def short_open(self, pair, collateral):
+        if not self.allow_shorts:
+            return {"Success": False, "ErrMsg": "this competition does not allow short positions"}
+        self.orders.append((pair, "SHORT_OPEN", collateral, "MARKET", None))
+        return {"Success": True, "Status": "OPEN", "Collateral": float(collateral)}
+
+    def short_close(self, pair, close_qty=None, close_pct=None):
+        self.orders.append((pair, "SHORT_CLOSE", close_qty, "MARKET", None))
+        return {"Success": True, "ReturnAmount": 1000.0, "FullyClosed": close_qty is None}
+
+
+def _executor(tmp_path, allow_shorts=True):
+    from bot import logger
+    from bot.config import BotConfig
+    logger.setup(str(tmp_path))
+    cfg = BotConfig()
+    cfg.dry_run = False
+    fc = FakeClient(allow_shorts)
+    ex = Executor(fc, cfg, {"BTC/USD": PairRule(2, 5, 1.0), "ETH/USD": PairRule(2, 4, 1.0)})
+    book = {"BTC": {"bid": 99.9, "ask": 100.1, "last": 100.0}, "ETH": {"bid": 9.99, "ask": 10.01, "last": 10.0}}
+    return ex, fc, book
+
+
+def test_executor_opens_short_sized_by_collateral(tmp_path):
+    ex, fc, book = _executor(tmp_path)
+    ex.rebalance(pd.Series({"BTC": -0.20}), {}, 100_000, 100_000, book, {})
+    assert fc.orders == [("BTC/USD", "SHORT_OPEN", "20000.00", "MARKET", None)]
+
+
+def test_executor_flips_long_to_short_selling_first(tmp_path):
+    ex, fc, book = _executor(tmp_path)
+    ex.rebalance(pd.Series({"ETH": -0.10}), {"ETH": 1000.0}, 90_000, 100_000, book, {})
+    assert fc.orders[0][:2] == ("ETH/USD", "SELL") and fc.orders[0][3] == "MARKET"
+    assert fc.orders[1][:2] == ("ETH/USD", "SHORT_OPEN")
+
+
+def test_executor_closes_and_reduces_shorts(tmp_path):
+    ex, fc, book = _executor(tmp_path)
+    shorts = {"BTC": {"qty": 200.0, "collateral": 20_000, "value": 20_000}}
+    ex.rebalance(pd.Series(dtype=float), {}, 80_000, 100_000, book, {}, shorts=shorts)
+    assert fc.orders == [("BTC/USD", "SHORT_CLOSE", None, "MARKET", None)]           # close all
+    fc.orders.clear()
+    ex.rebalance(pd.Series({"BTC": -0.10}), {}, 80_000, 100_000, book, {}, shorts=shorts)
+    assert fc.orders == [("BTC/USD", "SHORT_CLOSE", "100.00000", "MARKET", None)]    # halve it
+
+
+def test_executor_disables_shorts_when_exchange_refuses(tmp_path):
+    ex, fc, book = _executor(tmp_path, allow_shorts=False)
+    ex.rebalance(pd.Series({"BTC": -0.20}), {}, 100_000, 100_000, book, {})
+    assert ex.shorts_disabled
 
 
 def test_executor_band_sells_first_and_fallback(tmp_path):
@@ -122,3 +193,12 @@ def test_backtest_runs_and_reports_metrics():
     assert len(eq) > 500
     assert np.isfinite(m["composite"])
     assert eq.min() > 0
+
+
+def test_backtest_shorts_profit_in_steady_downtrend():
+    from dataclasses import replace
+    closes = synthetic(n=1500, drift=[-0.0006] * 6, seed=3)
+    _, with_shorts = backtest.run(closes, StrategyParams())
+    _, long_only = backtest.run(closes, replace(StrategyParams(), allow_shorts=False))
+    assert with_shorts["short_time"] > 0.2
+    assert with_shorts["ret"] > long_only["ret"]
