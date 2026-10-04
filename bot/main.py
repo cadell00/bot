@@ -36,6 +36,10 @@ class State:
     cooldown_until: dict = field(default_factory=dict)  # coin -> unix ts
     crash_until: float = 0.0
     daily_vol: dict = field(default_factory=dict)
+    equity_hist: list = field(default_factory=list)    # one equity sample per hour (rolling DD)
+    equity_hist_hour: str = ""
+    regime: dict = field(default_factory=dict)         # hysteresis state of the BTC regime
+    entry_ts: dict = field(default_factory=dict)       # coin -> unix ts when position was opened
 
     @classmethod
     def load(cls, path: str) -> "State":
@@ -102,8 +106,13 @@ class Bot:
         book, holdings, usd_free, cash, equity = self.snapshot()
         self.md.snapshots.record({c: book[c]["last"] for c in self.universe if c in book})
         st = self.state
+        p = self.cfg.strategy
         st.peak_equity = max(st.peak_equity, equity)
-        dd = 1 - equity / st.peak_equity if st.peak_equity > 0 else 0.0
+        hour_key = time.strftime("%Y-%m-%dT%H", time.gmtime(now))
+        if hour_key != st.equity_hist_hour:
+            st.equity_hist = (st.equity_hist + [round(equity, 2)])[-(p.dd_lookback_hours + 5):]
+            st.equity_hist_hour = hour_key
+        dd = strategy.rolling_drawdown(st.equity_hist + [equity], p.dd_lookback_hours)
         exposure = 1 - cash / equity if equity > 0 else 0.0
         logger.equity_row(equity, cash, dd, exposure)
 
@@ -113,9 +122,9 @@ class Bot:
             self.trade(st.targets, urgent, reason="risk_exit")
             book, holdings, usd_free, cash, equity = self.snapshot()
 
-        hour_key = time.strftime("%Y-%m-%dT%H", time.gmtime(now))
-        minute = time.gmtime(now).tm_min
-        if hour_key != st.last_rebalance_hour and minute >= self.cfg.rebalance_minute:
+        gm = time.gmtime(now)
+        on_schedule = gm.tm_hour % p.rebalance_every_hours == 0 or not st.last_rebalance_hour
+        if hour_key != st.last_rebalance_hour and gm.tm_min >= self.cfg.rebalance_minute and on_schedule:
             self.rebalance(held, dd, now)
             st.last_rebalance_hour = hour_key
         elif st.attempts and now - st.last_order_ts >= self.cfg.retry_minutes * 60:
@@ -135,6 +144,7 @@ class Bot:
         for coin in list(st.hwm):
             if coin not in held:
                 st.hwm.pop(coin)
+        st.entry_ts = {c: st.entry_ts.get(c, now) for c in held}
         for coin in held:
             px = book[coin]["last"]
             st.hwm[coin] = max(st.hwm.get(coin, px), px)
@@ -163,7 +173,10 @@ class Bot:
         if now < st.crash_until:
             w, info = pd.Series(dtype=float), {"regime": "crash_cooldown"}
         else:
-            w, info = strategy.decide(closes, held, p, dd, excluded)
+            locked = {c for c in held if now - st.entry_ts.get(c, now) < p.min_hold_hours * 3600}
+            w, info = strategy.decide(closes, held, p, dd, excluded, st.regime, locked)
+            info["locked"] = sorted(locked)
+            st.regime = info.pop("regime_state", st.regime)
         st.daily_vol = info.pop("daily_vol", st.daily_vol)
         st.targets = {k: round(float(v), 5) for k, v in w.items() if v > 0}
         logger.event("decisions", action="rebalance", drawdown=round(dd, 4), held=sorted(held),

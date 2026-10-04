@@ -54,11 +54,32 @@ def test_risk_off_goes_to_cash():
     assert info["regime"] == "risk_off"
 
 
-def test_drawdown_multiplier():
+def test_drawdown_multiplier_has_floor():
     p = StrategyParams()
     assert strategy.drawdown_multiplier(0.0, p) == 1.0
     assert strategy.drawdown_multiplier(p.max_drawdown / 2, p) == pytest.approx(0.5)
-    assert strategy.drawdown_multiplier(1.0, p) == 0.0
+    assert strategy.drawdown_multiplier(1.0, p) == p.dd_floor_mult
+
+
+def test_rolling_drawdown_recovers_after_window():
+    hist = [1.10] + [1.0] * 10
+    assert strategy.rolling_drawdown(hist, 24) == pytest.approx(1 - 1.0 / 1.10)
+    assert strategy.rolling_drawdown(hist, 5) == 0.0  # old peak has rolled out of the window
+
+
+def test_regime_hysteresis_does_not_flip_near_ema():
+    p = StrategyParams()
+    mult, name, st = strategy.regime_state(102.0, 100.0, 0.3, {}, p)
+    assert name == "risk_on"
+    # price dips slightly below EMA and score slightly negative: still risk_on (inside buffers)
+    mult, name, st = strategy.regime_state(99.5, 100.0, -0.05, st, p)
+    assert name == "risk_on"
+    # clear break on both: risk_off
+    mult, name, st = strategy.regime_state(97.0, 100.0, -0.3, st, p)
+    assert name == "risk_off" and mult == 0.0
+    # tiny recovery is not enough to turn back on
+    mult, name, st = strategy.regime_state(100.5, 100.0, 0.05, st, p)
+    assert name == "risk_off"
 
 
 class FakeClient:
