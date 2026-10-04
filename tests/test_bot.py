@@ -10,7 +10,7 @@ from bot.execution import Executor, PairRule, floor_to, fmt
 from bot.roostoo_client import RoostooClient
 
 
-def synthetic(n=900, coins=("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA"), seed=0, drift=None):
+def synthetic(n=1100, coins=("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA"), seed=0, drift=None):
     rng = np.random.default_rng(seed)
     idx = pd.date_range("2026-01-01", periods=n, freq="h")
     data = {}
@@ -188,7 +188,7 @@ def test_executor_band_sells_first_and_fallback(tmp_path):
 
 
 def test_backtest_runs_and_reports_metrics():
-    closes = synthetic(n=1200, drift=[0.0004, 0.0003, 0.0006, -0.0002, 0.0001, 0.0])
+    closes = synthetic(n=1800, drift=[0.0004, 0.0003, 0.0006, -0.0002, 0.0001, 0.0])
     eq, m = backtest.run(closes, StrategyParams())
     assert len(eq) > 500
     assert np.isfinite(m["composite"])
@@ -197,7 +197,7 @@ def test_backtest_runs_and_reports_metrics():
 
 def test_backtest_shorts_profit_in_steady_downtrend():
     from dataclasses import replace
-    closes = synthetic(n=1500, drift=[-0.0006] * 6, seed=3)
+    closes = synthetic(n=2200, drift=[-0.0006] * 6, seed=3)
     _, with_shorts = backtest.run(closes, StrategyParams())
     _, long_only = backtest.run(closes, replace(StrategyParams(), allow_shorts=False))
     assert with_shorts["short_time"] > 0.2

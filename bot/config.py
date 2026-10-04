@@ -49,14 +49,14 @@ MAJORS = ("BTC", "ETH")
 @dataclass
 class StrategyParams:
     # --- signal: volatility-normalised multi-horizon time-series momentum ---
-    lookbacks: tuple = field(default_factory=lambda: _env("LOOKBACKS", (24, 72, 168)))
+    lookbacks: tuple = field(default_factory=lambda: _env("LOOKBACKS", (168, 336, 720)))  # 1, 2, 4 weeks
     vol_window: int = _env("VOL_WINDOW", 168)          # hours used for realised vol
     regime_ema: int = _env("REGIME_EMA", 200)          # BTC trend filter (hours)
     asset_ema: int = _env("ASSET_EMA", 100)            # per-asset trend filter (hours)
     # --- selection ---
     top_k: int = _env("TOP_K", 4)
     hold_buffer: int = _env("HOLD_BUFFER", 2)           # held assets survive down to rank top_k+buffer
-    entry_threshold: float = _env("ENTRY_THRESHOLD", 0.25)
+    entry_threshold: float = _env("ENTRY_THRESHOLD", 0.40)
     exit_threshold: float = _env("EXIT_THRESHOLD", 0.05)
     min_hold_hours: int = _env("MIN_HOLD_HOURS", 24)    # no signal-driven exit before this (stops still apply)
     # --- sizing ---

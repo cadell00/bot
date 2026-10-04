@@ -85,7 +85,7 @@ def run(closes: pd.DataFrame, p: StrategyParams, fee: float = 0.001, band: float
     score, vol = strategy.score_frame(closes, p)
     regime_in = strategy.btc_regime_inputs(closes, score, p)
     logret = np.log(closes).diff()
-    rets = closes.pct_change().fillna(0.0)
+    rets = closes.pct_change(fill_method=None).fillna(0.0)
     warm = max(max(p.lookbacks), p.vol_window, p.regime_ema) + 1
     w = pd.Series(0.0, index=closes.columns)
     equity, gross_equity = 1.0, 1.0

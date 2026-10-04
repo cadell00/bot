@@ -4,7 +4,7 @@ An autonomous, long-only crypto trading bot for the Roostoo mock exchange. It ho
 
 ## Strategy in one paragraph
 
-Every 8 hours (00:00, 08:00 and 16:00 UTC), after the candle closes, the bot scores about 30 liquid crypto assets on **volatility-normalised time-series momentum**. It then switches its book on the **BTC trend regime**, which uses hysteresis buffers so it doesn't flip every hour:
+Every 8 hours (00:00, 08:00 and 16:00 UTC), after the candle closes, the bot scores about 30 liquid crypto assets on **volatility-normalised time-series momentum** over 1, 2 and 4 weeks. It then switches its book on the **BTC trend regime**, which uses hysteresis buffers so it doesn't flip every hour:
 
 - **Risk-on:** it holds **long** spot positions in the strongest uptrends (top 4).
 - **Risk-off:** it holds **short** positions in the weakest downtrends (bottom 3), using Roostoo's 1x-collateral short API.
@@ -77,7 +77,7 @@ tail -f logs/bot.log
 
 | Param | Default | Meaning |
 |---|---|---|
-| `lookbacks` | 24, 72, 168 h | momentum horizons |
+| `lookbacks` | 168, 336, 720 h | momentum horizons (1, 2, 4 weeks) |
 | `top_k` | 4 | max new long positions (held positions can stay up to rank 6) |
 | `allow_shorts` / `short_top_k` | on / 3 | short book in risk-off regimes |
 | `short_entry_threshold` / `short_max_weight` | 0.30 / 25% | how weak an asset must be to short, and the per-short size cap |
@@ -109,3 +109,13 @@ These figures are in-sample, because the same period informed the v2 fixes. Chec
 ## Out-of-sample finding and the short book (v4)
 
 On October 2025 to April 2026, which wasn't used in any design decision, the long-only version lost 17.2% (−11.4% before fees) while BTC fell 34%. Only 20% of 14-day windows were positive. Long-only momentum can only sit in cash during a bear market, and short-horizon signals kept buying rallies that failed. The competition allows shorts, so v4 adds a symmetric short book for risk-off regimes. `python backtest.py --days 365 --robust` judges every structural choice, including shorts on or off, on its worse half (bear or bull).
+
+## Final configuration (v5): chosen on both market regimes
+
+`python backtest.py --days 365 --robust` ran 48 settings over October 2025 to October 2026, scoring each half separately: a bear half (BTC −34%) and a bull half. It found:
+
+- **Shorts on:** all 24 shorts-on settings were profitable in both halves. Long-only lost money in the bear half in 15 of 24 settings. The median worse-half composite was +2.37 with shorts and −0.27 without.
+- **1–4 week horizons (168/336/720 h)** beat 1–7 days clearly: median worse-half composite 3.12 against −0.48. This matches the horizon at which the crypto momentum literature finds the effect.
+- **Remaining choices** (regime EMA 200 h, half-size longs in neutral, entry threshold 0.40) are the best value of each setting by median. All eight long-horizon, shorts-on settings scored within 3.3–4.2, so the result doesn't hinge on fine-tuning.
+
+The chosen setting returned +92.8% over the year (+25% in the bear half, +54% in the bull half), with a 14.3% max drawdown, composite 4.41, and 56% of 14-day windows positive, the highest of any setting. Backtests assume fills at hourly closes and pay 0.1% on every trade. Live results will differ.
