@@ -79,7 +79,8 @@ class Bot:
         self.cfg = cfg
         self.log = logger.setup(cfg.log_dir)
         os.makedirs(cfg.data_dir, exist_ok=True)
-        self.state_path = os.path.join(cfg.data_dir, "state.json")
+        # dry runs keep separate state so they never affect the live bot
+        self.state_path = os.path.join(cfg.data_dir, "state_dry_run.json" if cfg.dry_run else "state.json")
         self.state = State.load(self.state_path)
         self.client = RoostooClient(cfg.api_key, cfg.secret_key, cfg.base_url, cfg.min_request_interval)
         self.client.sync_clock()
