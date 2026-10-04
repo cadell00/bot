@@ -99,7 +99,7 @@ class BotConfig:
     retry_minutes: int = _env("RETRY_MINUTES", 10)          # re-quote unfilled limit orders
     max_limit_attempts: int = _env("MAX_LIMIT_ATTEMPTS", 3) # then fall back to market
     min_order_usd: float = _env("MIN_ORDER_USD", 50.0)
-    history_bars: int = _env("HISTORY_BARS", 500)
+    history_bars: int = _env("HISTORY_BARS", 1000)  # enough for 720h lookbacks + vol window
     min_request_interval: float = _env("MIN_REQUEST_INTERVAL", 0.35)  # seconds between API calls
     dry_run: bool = _env("DRY_RUN", False)
     log_dir: str = _env("LOG_DIR", "logs")

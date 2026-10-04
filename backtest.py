@@ -172,6 +172,47 @@ def _run_metrics(job) -> dict:
     return run(closes, params)[1]
 
 
+def _run_split(job) -> dict:
+    """Run once over the full period; score each half separately plus 14-day windows."""
+    closes, params, split = job
+    eq, m = run(closes, params)
+    first, second = metrics(eq[eq.index < split]), metrics(eq[eq.index >= split])
+    rw = rolling_windows(eq)
+    return dict(ret=m["ret"], maxdd=m["maxdd"], composite=m["composite"], turnover=m["turnover"],
+                exposure=m["avg_exposure"], h1_ret=first["ret"], h1_comp=first["composite"],
+                h2_ret=second["ret"], h2_comp=second["composite"],
+                worst_half=min(first["composite"], second["composite"]),
+                win14_pos=float((rw.ret > 0).mean()) if not rw.empty else 0.0,
+                win14_med=float(rw.ret.median()) if not rw.empty else 0.0)
+
+
+def robust_sweep(closes: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
+    """Structural sweep judged on BOTH halves of the data (e.g. bear then bull). Ranked by the
+    worse half, so a setting only scores well if it works in both market regimes."""
+    split = closes.index[len(closes) // 2]
+    grid = list(itertools.product(
+        [(24, 72, 168), (72, 168, 336), (168, 336, 720)],  # momentum horizons (hours)
+        [200, 500],                                        # BTC regime EMA (hours)
+        [0.5, 0.0],                                        # neutral regime: half size, or cash
+        [0.25, 0.40],                                      # entry threshold
+    ))
+    jobs = [(closes, replace(p, lookbacks=lb, regime_ema=ema, neutral_regime_mult=neu, entry_threshold=ent),
+             split) for lb, ema, neu, ent in grid]
+    with ProcessPoolExecutor() as pool:
+        results = list(pool.map(_run_split, jobs))
+    rows = [dict(lookbacks="/".join(str(x) for x in lb), regime_ema=ema, neutral=neu, entry=ent, **r)
+            for (lb, ema, neu, ent), r in zip(grid, results)]
+    df = pd.DataFrame(rows).sort_values("worst_half", ascending=False)
+    print(f"\nrobust sweep — half 1 ends {split}; ranked by the WORSE half's composite")
+    pd.set_option("display.width", 250)
+    print(df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    print("\nmedian worst-half composite by setting:")
+    for col in ("lookbacks", "regime_ema", "neutral", "entry"):
+        print(" ", df.groupby(col).worst_half.median().round(3).to_dict())
+    df.to_csv("data/robust_sweep.csv", index=False)
+    return df
+
+
 def rolling_windows(eq: pd.Series, days: int = 14) -> pd.DataFrame:
     step = days * 24
     out = []
@@ -197,6 +238,8 @@ def main():
     ap.add_argument("--days", type=int, default=180)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--robust", action="store_true",
+                    help="structural sweep scored on both halves of the data (use with --days 365)")
     ap.add_argument("--plot", action="store_true")
     ap.add_argument("--since", default=None, help="only use data from this date, e.g. 2025-10-01")
     ap.add_argument("--until", default=None, help="only use data up to this date (out-of-sample tests)")
@@ -239,6 +282,9 @@ def main():
               " not the single best row):")
         for col in ("top_k", "tvol", "maxdd_lim", "every", "hold"):
             print(" ", df.groupby(col).composite.median().round(3).to_dict())
+
+    if a.robust:
+        robust_sweep(closes, p)
 
     if a.plot:
         import matplotlib.pyplot as plt
